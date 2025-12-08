@@ -16,12 +16,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    import matplotlib
+import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
 except ImportError:  # pragma: no cover - optional dependency
     plt = None
+
+try:
+    from huggingface_hub import HfApi
+except ImportError:
+    HfApi = None  # type: ignore
 
 
 DEFAULT_MODEL_REPOS = [
@@ -36,6 +41,7 @@ DEFAULT_BATCH_SIZES = [512, 1024, 2048]
 DEFAULT_UBATCH_SIZES = [128, 256, 512]
 DEFAULT_PROMPT_TOKENS = [128, 512]
 DEFAULT_GEN_TOKENS = [128, 512]
+DEFAULT_RAM_HEADROOM = 1.2
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -80,6 +86,19 @@ def gather_cpu_info() -> dict[str, Any]:
     return info
 
 
+def total_ram_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    parts = line.split()
+                    # value in kB
+                    return int(parts[1]) * 1024
+    except Exception:
+        return None
+    return None
+
+
 def gather_system_context() -> dict[str, Any]:
     return {
         "hostname": socket.gethostname(),
@@ -87,6 +106,7 @@ def gather_system_context() -> dict[str, Any]:
         "python": sys.version.split()[0],
         "cpu_count": os.cpu_count(),
         "cpu_info": gather_cpu_info(),
+        "total_ram_bytes": total_ram_bytes(),
     }
 
 
@@ -194,13 +214,37 @@ def resolve_repo_model(
     quantization: str,
     cache_dir: Path,
     download: bool,
-) -> Path:
+    api: Any,
+    total_ram: int | None,
+    ram_headroom: float,
+    skip_low_ram: bool,
+) -> Path | None:
     target_dir = cache_dir / repo_id.replace("/", "__")
     target_dir.mkdir(parents=True, exist_ok=True)
     filename = model_filename(repo_id, quantization)
     direct_path = target_dir / filename
     if direct_path.exists():
         return direct_path
+
+    expected_size = None
+    if api is not None:
+        try:
+            repo_info = api.repo_info(repo_id, files_metadata=True)
+            for sibling in repo_info.siblings:
+                if sibling.rfilename.endswith(f"{quantization}.gguf") and sibling.size is not None:
+                    expected_size = sibling.size
+                    break
+        except Exception:
+            expected_size = None
+
+    if skip_low_ram and total_ram is not None and expected_size is not None:
+        needed = expected_size * ram_headroom
+        if total_ram < needed:
+            print(
+                f"Skipping {repo_id} {quantization}: requires ~{needed/1e9:.2f} GB with headroom, "
+                f"but only {total_ram/1e9:.2f} GB RAM available."
+            )
+            return None
 
     if not download:
         raise FileNotFoundError(
@@ -351,6 +395,10 @@ def iter_model_paths(
     quantizations: list[str] | None,
     cache_dir: Path,
     download_models: bool,
+    api: Any,
+    total_ram: int | None,
+    ram_headroom: float,
+    skip_low_ram: bool,
 ) -> Iterable[tuple[Path, str | None, str | None]]:
     if model_paths:
         for path in model_paths:
@@ -362,8 +410,18 @@ def iter_model_paths(
 
     for repo in repos:
         for quant in quants:
-            resolved = resolve_repo_model(repo, quant, cache_dir, download_models)
-            yield (resolved, repo, quant)
+            resolved = resolve_repo_model(
+                repo,
+                quant,
+                cache_dir,
+                download_models,
+                api,
+                total_ram,
+                ram_headroom,
+                skip_low_ram,
+            )
+            if resolved is not None:
+                yield (resolved, repo, quant)
 
 
 def main() -> None:
@@ -407,6 +465,18 @@ def main() -> None:
         type=Path,
         default=base_dir / "models-cache",
         help="Where to store/download models when using repo IDs.",
+    )
+    parser.add_argument(
+        "--ram-headroom",
+        type=float,
+        default=DEFAULT_RAM_HEADROOM,
+        help="Safety factor for RAM vs model file size before download (default: 1.2x).",
+    )
+    parser.add_argument(
+        "--skip-low-ram",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip models if total RAM is below required headroom (default: True).",
     )
     parser.add_argument(
         "--threads",
@@ -471,6 +541,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    total_ram = total_ram_bytes()
+    api = None
+    if HfApi is not None:
+        api = HfApi()
+    elif args.download_models:
+        raise RuntimeError(
+            "huggingface_hub is required for model downloads and metadata. Install it in the venv."
+        )
+
     bench_bin = ensure_binary(args.bench_binary)
     threads = args.threads or default_thread_sweep()
     batch_sizes = args.batch_sizes or DEFAULT_BATCH_SIZES
@@ -500,6 +579,10 @@ def main() -> None:
             args.quantizations,
             args.model_cache,
             args.download_models,
+            api,
+            total_ram,
+            args.ram_headroom,
+            args.skip_low_ram,
         )
         for thr in threads
         for batch in batch_sizes
@@ -537,7 +620,6 @@ def main() -> None:
         remaining = (total - idx) * avg_per
         eta_str = time.strftime("%H:%M:%S", time.gmtime(remaining))
 
-        cat = render_cat(idx)
         print(
             f"[{idx}/{total} | ETA {eta_str}] "
             f"{model_repo or model_path.name} {quantization or ''} "
@@ -552,4 +634,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-import time

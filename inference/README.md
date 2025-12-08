@@ -37,3 +37,4 @@ unsloth/gemma-3-12B-it-GGUF
 - Shapes: sweep batch sizes 512/1024/2048, micro-batch 128/256/512, prompt 128/512 tokens, generate 128/512 tokens (change with CLI flags).
 - Repetitions: 3 runs per config passed to `llama-bench` (`--repetitions`).
 - Bench binary: `llama.cpp/build/bin/llama-bench`; results persist incrementally to `result/result.json` with per-run metadata and raw stdout/stderr. Plots (e.g., throughput vs threads/batch, latency vs threads) are written alongside the JSON in `result/`.
+- RAM guard: defaults skip downloading a model/quant if total system RAM is below ~1.2x the file size; adjust with `--ram-headroom` or disable with `--skip-low-ram false`.
