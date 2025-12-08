@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-import matplotlib
+    import matplotlib
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: E402
 except ImportError:  # pragma: no cover - optional dependency
     plt = None
 
