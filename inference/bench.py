@@ -92,32 +92,8 @@ def gather_system_context() -> dict[str, Any]:
 
 def default_thread_sweep() -> list[int]:
     cpu_count = os.cpu_count() or 1
-    candidates = [1, max(1, cpu_count // 2), cpu_count]
-    seen = set()
-    deduped: list[int] = []
-    for c in candidates:
-        if c not in seen:
-            deduped.append(c)
-            seen.add(c)
-    return deduped
+    return list(range(1, cpu_count + 1))
 
-
-def cat_frames() -> list[str]:
-    # Simple 2-frame cat walk animation.
-    return [
-        " /\\_/\\",
-        " =^.^=",
-        "  > <",
-    ]
-
-
-def render_cat(step: int) -> str:
-    frames = [
-        [" /\\_/\\", " (=^.^)", "  /   "],
-        [" /\\_/\\", " (=^.^)", "   \\  "],
-    ]
-    frame = frames[step % len(frames)]
-    return "\n".join(frame)
 
 
 def ensure_binary(path: Path) -> Path:
@@ -436,7 +412,7 @@ def main() -> None:
         "--threads",
         type=parse_int_list,
         default=None,
-        help="Comma-separated thread counts (default: 1, half, all cores).",
+        help="Comma-separated thread counts (default: full sweep 1..logical cores).",
     )
     parser.add_argument(
         "--batch-size",
@@ -536,10 +512,6 @@ def main() -> None:
     start_time = time.time()
 
     for idx, (model_path, model_repo, quantization, thr, batch, ubatch, prompt_tokens, gen_tokens) in enumerate(combos, start=1):
-        # animate cat walking inline in the console
-        cat_frame = render_cat(idx)
-        print(cat_frame, end="\r", flush=True)
-
         params = BenchParams(
             model_path=model_path,
             model_repo=model_repo,
@@ -571,7 +543,7 @@ def main() -> None:
             f"{model_repo or model_path.name} {quantization or ''} "
             f"threads={thr} batch={batch} ubatch={ubatch} "
             f"prompt={prompt_tokens} gen={gen_tokens} "
-            f"rc={run_result['returncode']}\n{cat}\n"
+            f"rc={run_result['returncode']}"
         )
 
     result["plots"] = generate_plots(result, args.result_path.parent)

@@ -33,7 +33,7 @@ unsloth/gemma-3-12B-it-GGUF
 - Defaults sweep the models/quantizations above, download them into `models-cache/`, run llama-bench, and update `result/result.json` after each run.
 - If downloads fail, install `huggingface_hub` in the venv. Plots require `matplotlib` (`pip install matplotlib`).
 - Models: unsloth Gemma 270M, 1B, 4B, 12B (GGUF) with quantizations Q4_K_M, Q8_0, Q2_K_L (downloaded to `models-cache/`).
-- Threads: sweep 1, half, and all logical CPUs for OMP/LLAMA/GGML thread envs; override via `--threads 1,2,...`.
+- Threads: sweep all logical CPU counts 1..N for OMP/LLAMA/GGML thread envs by default; override via `--threads 1,2,...`.
 - Shapes: sweep batch sizes 512/1024/2048, micro-batch 128/256/512, prompt 128/512 tokens, generate 128/512 tokens (change with CLI flags).
 - Repetitions: 3 runs per config passed to `llama-bench` (`--repetitions`).
 - Bench binary: `llama.cpp/build/bin/llama-bench`; results persist incrementally to `result/result.json` with per-run metadata and raw stdout/stderr. Plots (e.g., throughput vs threads/batch, latency vs threads) are written alongside the JSON in `result/`.
