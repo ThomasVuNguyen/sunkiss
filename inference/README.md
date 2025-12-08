@@ -38,3 +38,7 @@ unsloth/gemma-3-12B-it-GGUF
 - Repetitions: 3 runs per config passed to `llama-bench` (`--repetitions`).
 - Bench binary: `llama.cpp/build/bin/llama-bench`; results persist incrementally to `result/result.json` with per-run metadata and raw stdout/stderr. Plots (e.g., throughput vs threads/batch, latency vs threads) are written alongside the JSON in `result/`.
 - RAM guard: defaults skip downloading a model/quant if total system RAM is below ~1.2x the file size; adjust with `--ram-headroom` or disable with `--skip-low-ram false`.
+
+# Conversations
+
+codex resume 019aff11-118a-7c82-add9-353e3b20ef6b
