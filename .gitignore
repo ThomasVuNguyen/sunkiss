@@ -1,0 +1,3 @@
+inference/llama.cpp
+inference/models-cache/
+inference/venv/
