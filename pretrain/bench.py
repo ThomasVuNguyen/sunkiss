@@ -403,9 +403,9 @@ def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_he
     class DecoderModel(nn.Module):
         @nn.compact
         def __call__(self, x, deterministic: bool = False):
-            embed = nn.Embed(vocab_size=vocab_size, features=width, name="embed")(x)
+            embed = nn.Embed(num_embeddings=vocab_size, features=width, name="embed")(x)
             positions = jnp.arange(seq_len)[None, :]
-            pos_emb = nn.Embed(vocab_size=seq_len, features=width, name="pos_embed")(positions)
+            pos_emb = nn.Embed(num_embeddings=seq_len, features=width, name="pos_embed")(positions)
             h = embed + pos_emb
             for _ in range(depth):
                 h = DecoderBlock()(h, deterministic)
