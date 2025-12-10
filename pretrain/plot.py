@@ -142,7 +142,8 @@ def plot_precision(df: pd.DataFrame, outdir: Path) -> None:
         row="config" if "config" in df.columns else None,
         kind="bar",
         order=sorted(df["precision"].unique()),
-        facet_kws={"sharey": False, "sharex": True},
+        sharey=False,
+        sharex=True,
     )
     g.set_axis_labels("Precision/Quant", "Mean step time (s)")
     g.figure.suptitle("Mean step time vs precision", y=1.02)
