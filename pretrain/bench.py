@@ -665,47 +665,25 @@ def batched(arr: np.ndarray, batch_size: int) -> Iterable[np.ndarray]:
         yield arr[start:end]
 
 
-def load_existing_csv_header(csv_path: Path) -> Optional[List[str]]:
-    if not csv_path.exists():
-        return None
-    with csv_path.open("r", encoding="utf-8") as f:
-        first_line = f.readline().strip()
-    if not first_line:
-        return None
-    return first_line.split(",")
-
-
-def write_result_row(row: Dict[str, object], csv_path: Path, jsonl_path: Path, header: Optional[List[str]]) -> List[str]:
+def write_result_row(row: Dict[str, object], csv_path: Path, jsonl_path: Path) -> List[str]:
     row_for_csv = {k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in row.items()}
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure header includes any new keys; if not, reload and rewrite the CSV with merged columns.
-    existing_cols = set(header) if header else set()
-    row_cols = set(row_for_csv.keys())
-    missing = row_cols - existing_cols
-    if csv_path.exists() and (missing or header is None):
+    if csv_path.exists():
         try:
             df_existing = pd.read_csv(csv_path)
         except Exception:
             df_existing = pd.DataFrame()
-        df_new = pd.DataFrame([row_for_csv])
-        df_merged = pd.concat([df_existing, df_new], ignore_index=True)
-        df_merged.to_csv(csv_path, index=False)
-        header = list(df_merged.columns)
     else:
-        if header is None:
-            header = list(row_for_csv.keys())
-        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-        with csv_path.open("a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=header)
-            if write_header:
-                writer.writeheader()
-            writer.writerow(row_for_csv)
+        df_existing = pd.DataFrame()
+    df_new = pd.DataFrame([row_for_csv])
+    df_merged = pd.concat([df_existing, df_new], ignore_index=True)
+    df_merged.to_csv(csv_path, index=False)
 
     with jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
-    return header
+    return list(df_merged.columns)
 
 
 def config_key(cfg: RunConfig) -> str:
@@ -739,48 +717,33 @@ def load_completed_configs(csv_path: Path) -> set:
         df = pd.read_csv(csv_path)
     except Exception:
         return set()
-    required_cols = [
-        "framework",
-        "precision",
-        "compilation_mode",
-        "attention_backend",
-        "kv_heads",
-        "seq_len",
-        "depth",
-        "width",
-        "num_heads",
-        "mlp_ratio",
-        "dropout",
-        "attention_variant",
-        "steps",
-        "batch_size",
-        "num_threads",
-        "inter_op_threads",
-        "pin_threads",
-    ]
-    if not all(col in df.columns for col in required_cols):
-        return set()
     completed = set()
     for _, row in df.iterrows():
+        def get(col, default=None):
+            val = row[col] if col in row else default
+            if pd.isna(val) and default is not None:
+                return default
+            return val
+
         cfg = RunConfig(
-            framework=row["framework"],
-            precision=row["precision"],
-            compilation_mode=row.get("compilation_mode", "eager"),
-            attention_backend=row.get("attention_backend", "manual"),
-            kv_heads=int(row["kv_heads"]) if "kv_heads" in row else int(row["num_heads"]),
-            seq_len=int(row["seq_len"]),
+            framework=get("framework"),
+            precision=get("precision"),
+            compilation_mode=get("compilation_mode", "eager"),
+            attention_backend=get("attention_backend", "manual"),
+            kv_heads=int(get("kv_heads", get("num_heads", 1))),
+            seq_len=int(get("seq_len", 0)),
             vocab_size=257,
-            depth=int(row["depth"]),
-            width=int(row["width"]),
-            num_heads=int(row["num_heads"]),
-            mlp_ratio=float(row["mlp_ratio"]),
-            dropout=float(row["dropout"]),
-            attention_variant=row["attention_variant"],
-            steps=int(row["steps"]),
-            batch_size=int(row["batch_size"]),
-            num_threads=int(row["num_threads"]),
-            inter_op_threads=int(row["inter_op_threads"]) if not pd.isna(row["inter_op_threads"]) else None,
-            pin_threads=bool(row["pin_threads"]),
+            depth=int(get("depth", 0)),
+            width=int(get("width", 0)),
+            num_heads=int(get("num_heads", 1)),
+            mlp_ratio=float(get("mlp_ratio", 4.0)),
+            dropout=float(get("dropout", 0.0)),
+            attention_variant=get("attention_variant", "full"),
+            steps=int(get("steps", 10)),
+            batch_size=int(get("batch_size", 1)),
+            num_threads=int(get("num_threads", 1)),
+            inter_op_threads=int(get("inter_op_threads")) if not pd.isna(get("inter_op_threads", None)) else None,
+            pin_threads=bool(get("pin_threads", False)),
         )
         completed.add(config_key(cfg))
     return completed
@@ -838,7 +801,7 @@ def main():
     sysinfo = collect_sysinfo()
     csv_path = Path(args.result_path)
     jsonl_path = Path(args.jsonl)
-    csv_header = load_existing_csv_header(csv_path)
+    csv_header = None
     completed = load_completed_configs(csv_path)
 
     print(f"[plan] running {len(configs)} configs in {args.mode} mode")
@@ -880,7 +843,7 @@ def main():
         }
         if "compiled" in out:
             result_row["compiled"] = out["compiled"]
-        csv_header = write_result_row(result_row, csv_path, jsonl_path, csv_header)
+        csv_header = write_result_row(result_row, csv_path, jsonl_path)
 
     print(f"[done] appended results to {csv_path} and {jsonl_path}")
 
