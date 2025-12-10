@@ -108,6 +108,19 @@ def maybe_set_cpu_affinity(cores: List[int]) -> None:
 
 
 def collect_sysinfo() -> Dict[str, object]:
+    cpu_model = None
+    cpu_flags = None
+    cpuinfo_path = Path("/proc/cpuinfo")
+    if cpuinfo_path.exists():
+        text = cpuinfo_path.read_text(errors="ignore")
+        for line in text.splitlines():
+            if line.lower().startswith("model name"):
+                cpu_model = line.split(":", 1)[1].strip()
+            if line.lower().startswith("flags"):
+                cpu_flags = line.split(":", 1)[1].strip()
+            if cpu_model and cpu_flags:
+                break
+
     uname = os.uname() if hasattr(os, "uname") else None
     uname_dict = (
         {"sysname": uname.sysname, "nodename": uname.nodename, "release": uname.release, "version": uname.version, "machine": uname.machine}
@@ -118,7 +131,10 @@ def collect_sysinfo() -> Dict[str, object]:
         "cpu_count_logical": psutil.cpu_count(logical=True),
         "cpu_count_physical": psutil.cpu_count(logical=False),
         "cpu_freq": psutil.cpu_freq()._asdict() if psutil.cpu_freq() else None,
+        "cpu_model": cpu_model,
+        "cpu_flags": cpu_flags,
         "memory_gb": round(psutil.virtual_memory().total / (1024**3), 2),
+        "memory_bytes": psutil.virtual_memory().total,
         "platform": uname_dict,
     }
 
