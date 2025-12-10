@@ -370,11 +370,10 @@ def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_he
             q = q.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
             k = k.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
             v = v.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            attn_mask = jnp.full((x.shape[1], x.shape[1]), -1e9)
-            idx = jnp.arange(x.shape[1])
-            for i in range(x.shape[1]):
-                start = jnp.maximum(0, i - self.window)
-                attn_mask = attn_mask.at[i, start : i + 1].set(0.0)
+            seq_len = x.shape[1]
+            idx = jnp.arange(seq_len)
+            diff = idx[:, None] - idx[None, :]
+            attn_mask = jnp.where((diff <= 0) & (diff >= -self.window), 0.0, -1e9)
             out = dot_product_attention(q, k, v, bias=attn_mask, deterministic=deterministic)
             out = out.reshape(x.shape[0], x.shape[1], self.num_heads * self.head_dim)
             out = nn.Dense(self.num_heads * self.head_dim)(out)
