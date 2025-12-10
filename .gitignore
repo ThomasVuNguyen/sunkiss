@@ -5,3 +5,4 @@ inference/result/
 
 pretrain/venv/
 pretrain/data/
+pretrain/__pycache__/
