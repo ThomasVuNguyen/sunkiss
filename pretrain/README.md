@@ -113,3 +113,8 @@ Output:
   - what each variables are & what is the training time
 
 Style: As this is a giant experiment, make sure each experiment is small enough to be run quickly, while still gives us a good idea of how the relationships between variables and training time are.
+
+
+Convo:
+
+codex resume 019b0625-d2a9-7571-babc-e6324b27b22c --yolo
