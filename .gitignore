@@ -2,3 +2,6 @@ inference/llama.cpp
 inference/models-cache/
 inference/venv/
 inference/result/
+
+pretrain/venv/
+pretrain/data/
