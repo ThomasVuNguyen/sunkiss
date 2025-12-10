@@ -625,7 +625,14 @@ def build_sweep_configs(args) -> List[RunConfig]:
         for precision in args.precisions:
             for compilation_mode in comp_modes:
                 for scenario in scenarios:
-                    kv_list = [k for k in args.kv_heads_options if k <= scenario["heads"]] or [scenario["heads"]]
+                    kv_list = []
+                    for k in args.kv_heads_options:
+                        if k == "num_heads":
+                            kv_list.append(scenario["heads"])
+                        elif isinstance(k, int) and k <= scenario["heads"]:
+                            kv_list.append(k)
+                    if not kv_list:
+                        kv_list = [scenario["heads"]]
                     for attention_backend in args.attention_backends:
                         backend = attention_backend
                         if scenario["attention_variant"] != "full" and attention_backend == "sdpa":
@@ -756,7 +763,7 @@ def main():
     parser.add_argument("--mode", choices=["sweep", "single"], default="sweep", help="sweep runs curated matrix by default")
     parser.add_argument("--compilation-modes", default="eager,compile", help="Comma-separated: eager,compile")
     parser.add_argument("--attention-backends", default="manual,sdpa", help="Comma-separated attention backends")
-    parser.add_argument("--kv-heads-options", default="1", help="Comma-separated kv_heads options (<= num_heads)")
+    parser.add_argument("--kv-heads-options", default="1", help="Comma-separated kv_heads options (<= num_heads); use 'num_heads' to match heads")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--width", type=int, default=512)
@@ -786,7 +793,16 @@ def main():
     args.thread_options = [t.strip() for t in args.thread_options.split(",") if t.strip()]
     args.compilation_modes = [c.strip() for c in args.compilation_modes.split(",") if c.strip()]
     args.attention_backends = [a.strip() for a in args.attention_backends.split(",") if a.strip()]
-    args.kv_heads_options = [int(k) for k in args.kv_heads_options.split(",") if k.strip()]
+    kv_opts = []
+    for k in args.kv_heads_options.split(","):
+        k = k.strip()
+        if not k:
+            continue
+        if k.lower() == "num_heads":
+            kv_opts.append("num_heads")
+        else:
+            kv_opts.append(int(k))
+    args.kv_heads_options = kv_opts
     args.batch_options = [int(b) for b in args.batch_options.split(",") if b.strip()]
 
     configs = build_sweep_configs(args) if args.mode == "sweep" else build_single_config(args)
