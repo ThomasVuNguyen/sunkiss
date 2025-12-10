@@ -289,6 +289,7 @@ def torch_train_step(model, optimizer, loss_fn, batch, precision: str):
 
 def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, object]:
     import torch
+    from tqdm import tqdm
 
     set_threading(config.num_threads, interop_threads=config.inter_op_threads)
     if config.pin_threads:
@@ -313,13 +314,21 @@ def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, o
 
     torch.manual_seed(0)
     durations = []
-    for step_idx, batch_np in enumerate(batches):
+    iterator = tqdm(
+        batches,
+        total=config.steps,
+        desc=f"{config.framework}-{config.precision}-seq{config.seq_len}-thr{config.num_threads}",
+        leave=False,
+    )
+    for step_idx, batch_np in enumerate(iterator):
+        if step_idx >= config.steps:
+            break
         batch = torch.tensor(batch_np, dtype=torch.long)
         t0 = time.time()
         loss_val = torch_train_step(model, optimizer, loss_fn, batch, precision=config.precision)
-        durations.append(time.time() - t0)
-        if step_idx + 1 >= config.steps:
-            break
+        step_dur = time.time() - t0
+        durations.append(step_dur)
+        iterator.set_postfix({"last_loss": f"{loss_val:.4f}", "step_s": f"{step_dur:.3f}"}, refresh=False)
     return {"loss_last": loss_val, "durations": durations}
 
 
@@ -406,6 +415,7 @@ def run_jax(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, obj
     import jax
     import jax.numpy as jnp
     import optax
+    from tqdm import tqdm
     from flax.training.train_state import TrainState
 
     model = make_jax_model(
@@ -442,15 +452,23 @@ def run_jax(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, obj
 
     durations = []
     loss_val = None
-    for step_idx, batch_np in enumerate(batches):
+    iterator = tqdm(
+        batches,
+        total=config.steps,
+        desc=f"{config.framework}-{config.precision}-seq{config.seq_len}-thr{config.num_threads}",
+        leave=False,
+    )
+    for step_idx, batch_np in enumerate(iterator):
+        if step_idx >= config.steps:
+            break
         batch = jnp.array(batch_np)
         t0 = time.time()
         rng, step_rng = jax.random.split(rng)
         loss_val, grads = grad_fn(state.params, batch, step_rng)
         state = state.apply_gradients(grads=grads)
-        durations.append(time.time() - t0)
-        if step_idx + 1 >= config.steps:
-            break
+        step_dur = time.time() - t0
+        durations.append(step_dur)
+        iterator.set_postfix({"last_loss": f"{float(loss_val):.4f}", "step_s": f"{step_dur:.3f}"}, refresh=False)
     return {"loss_last": float(loss_val), "durations": durations}
 
 
@@ -583,12 +601,19 @@ def main():
     results = []
     sysinfo = collect_sysinfo()
     print(f"[plan] running {len(configs)} configs in {args.mode} mode")
-    for cfg in configs:
-        batches = batched(data_cache[cfg.seq_len], cfg.batch_size)
+    overall_start = time.time()
+    for idx, cfg in enumerate(configs, 1):
+        elapsed = time.time() - overall_start
+        if idx > 1:
+            avg = elapsed / (idx - 1)
+            remaining = avg * (len(configs) - idx + 1)
+        else:
+            remaining = 0.0
         print(
-            f"[run] {cfg.framework} precision={cfg.precision} steps={cfg.steps} threads={cfg.num_threads} "
-            f"seq={cfg.seq_len} depth={cfg.depth} width={cfg.width} heads={cfg.num_heads} pin={cfg.pin_threads}"
+            f"[run {idx}/{len(configs)} | ETA ~{remaining:.1f}s] {cfg.framework} precision={cfg.precision} steps={cfg.steps} "
+            f"threads={cfg.num_threads} seq={cfg.seq_len} depth={cfg.depth} width={cfg.width} heads={cfg.num_heads} pin={cfg.pin_threads}"
         )
+        batches = batched(data_cache[cfg.seq_len], cfg.batch_size)
         if cfg.framework == "torch":
             out = run_torch(cfg, batches)
         elif cfg.framework == "jax":
