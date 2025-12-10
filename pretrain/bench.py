@@ -11,6 +11,7 @@ import csv
 import json
 import os
 import time
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -136,6 +137,11 @@ def collect_sysinfo() -> Dict[str, object]:
         "memory_gb": round(psutil.virtual_memory().total / (1024**3), 2),
         "memory_bytes": psutil.virtual_memory().total,
         "platform": uname_dict,
+        "allocator": {
+            "ld_preload": os.environ.get("LD_PRELOAD", ""),
+            "malloc_conf": os.environ.get("MALLOC_CONF", ""),
+        },
+        "numa_nodes": len(list(Path("/sys/devices/system/node").glob("node[0-9]*"))),
     }
 
 
@@ -148,13 +154,19 @@ def make_torch_model(
     depth: int,
     width: int,
     num_heads: int,
+    kv_heads: int,
     mlp_ratio: float,
     dropout: float,
     attention_variant: str,
+    attention_backend: str,
 ):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+
+    kv_heads = max(1, min(kv_heads, num_heads))
+    if num_heads % kv_heads != 0:
+        kv_heads = num_heads
 
     class PositionalEncoding(nn.Module):
         def __init__(self, d_model: int, max_len: int) -> None:
@@ -169,31 +181,64 @@ def make_torch_model(
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             return x + self.pe[:, : x.size(1)]
 
-    class LocalSelfAttention(nn.Module):
-        def __init__(self, d_model: int, num_heads: int, window: int) -> None:
+    class SelfAttentionCore(nn.Module):
+        def __init__(self, d_model: int, num_heads: int, kv_heads: int, dropout: float, variant: str, window: int, backend: str):
             super().__init__()
-            self.mha = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+            self.num_heads = num_heads
+            self.kv_heads = kv_heads
+            self.variant = variant
             self.window = window
+            self.backend = backend
+            head_dim = d_model // num_heads
+            self.q_proj = nn.Linear(d_model, num_heads * head_dim)
+            self.k_proj = nn.Linear(d_model, kv_heads * head_dim)
+            self.v_proj = nn.Linear(d_model, kv_heads * head_dim)
+            self.out_proj = nn.Linear(num_heads * head_dim, d_model)
+            self.dropout = dropout
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            attn_mask = torch.full((x.size(1), x.size(1)), float("-inf"), device=x.device)
-            for i in range(x.size(1)):
-                start = max(0, i - self.window)
-                attn_mask[i, start : i + 1] = 0  # causal local window
-            out, _ = self.mha(x, x, x, attn_mask=attn_mask)
-            return out
+            bsz, seq, _ = x.shape
+            head_dim = self.q_proj.out_features // self.num_heads
+            q = self.q_proj(x).view(bsz, seq, self.num_heads, head_dim).transpose(1, 2)  # (B, H, S, D)
+            k = self.k_proj(x).view(bsz, seq, self.kv_heads, head_dim).transpose(1, 2)  # (B, Kv, S, D)
+            v = self.v_proj(x).view(bsz, seq, self.kv_heads, head_dim).transpose(1, 2)
+
+            if self.kv_heads != self.num_heads:
+                repeat = self.num_heads // self.kv_heads
+                k = k.repeat_interleave(repeat, dim=1)
+                v = v.repeat_interleave(repeat, dim=1)
+
+            idx = torch.arange(seq, device=x.device)
+            diff = idx[:, None] - idx[None, :]
+            if self.variant == "local":
+                mask = torch.where((diff <= 0) & (diff >= -self.window), 0.0, float("-inf"))
+            elif self.variant == "sliding":
+                mask = torch.where((diff <= 0) & (diff >= -self.window), 0.0, float("-inf"))
+            else:
+                mask = torch.triu(torch.full((seq, seq), float("-inf"), device=x.device), 1)
+
+            if self.backend == "sdpa":
+                attn_out = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=mask, dropout_p=self.dropout, is_causal=False
+                )  # (B, H, S, D)
+            else:
+                scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(head_dim)
+                scores = scores + mask
+                attn = torch.softmax(scores, dim=-1)
+                attn = F.dropout(attn, p=self.dropout, training=self.training)
+                attn_out = torch.matmul(attn, v)
+
+            attn_out = attn_out.transpose(1, 2).contiguous().view(bsz, seq, self.num_heads * head_dim)
+            return self.out_proj(attn_out)
 
     class DecoderBlock(nn.Module):
-        def __init__(self, d_model: int, num_heads: int, mlp_ratio: float, dropout: float, attention_variant: str):
+        def __init__(self, d_model: int, num_heads: int, kv_heads: int, mlp_ratio: float, dropout: float, attention_variant: str, attention_backend: str):
             super().__init__()
+            window = 128 if attention_variant == "local" else 256
             self.ln1 = nn.LayerNorm(d_model)
             self.ln2 = nn.LayerNorm(d_model)
-            if attention_variant == "local":
-                self.attn = LocalSelfAttention(d_model, num_heads, window=128)
-            elif attention_variant == "sliding":
-                self.attn = LocalSelfAttention(d_model, num_heads, window=256)
-            else:
-                self.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+            backend = attention_backend if attention_variant == "full" or attention_backend == "sdpa" else "manual"
+            self.attn = SelfAttentionCore(d_model, num_heads, kv_heads, dropout, attention_variant, window, backend)
             self.mlp = nn.Sequential(
                 nn.Linear(d_model, int(d_model * mlp_ratio)),
                 nn.GELU(),
@@ -204,10 +249,7 @@ def make_torch_model(
             self.dropout = nn.Dropout(dropout)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            attn_out, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x)) if isinstance(
-                self.attn, nn.MultiheadAttention
-            ) else (self.attn(self.ln1(x)), None)
-            x = x + self.dropout(attn_out)
+            x = x + self.dropout(self.attn(self.ln1(x)))
             x = x + self.mlp(self.ln2(x))
             return x
 
@@ -217,7 +259,10 @@ def make_torch_model(
             self.embedding = nn.Embedding(vocab_size, width, padding_idx=0)
             self.pos = PositionalEncoding(width, seq_len)
             self.layers = nn.ModuleList(
-                [DecoderBlock(width, num_heads, mlp_ratio, dropout, attention_variant) for _ in range(depth)]
+                [
+                    DecoderBlock(width, num_heads, kv_heads, mlp_ratio, dropout, attention_variant, attention_backend)
+                    for _ in range(depth)
+                ]
             )
             self.ln = nn.LayerNorm(width)
             self.head = nn.Linear(width, vocab_size)
@@ -320,11 +365,20 @@ def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, o
         depth=config.depth,
         width=config.width,
         num_heads=config.num_heads,
+        kv_heads=config.kv_heads,
         mlp_ratio=config.mlp_ratio,
         dropout=config.dropout,
         attention_variant=config.attention_variant,
+        attention_backend=config.attention_backend,
     )
     model = apply_torch_quantization(model, config.precision)
+    compiled = False
+    if config.compilation_mode == "compile":
+        try:
+            model = torch.compile(model, fullgraph=True, mode="max-autotune")
+            compiled = True
+        except Exception as exc:
+            print(f"[warn] torch.compile failed ({exc}); falling back to eager")
     model = model.to("cpu")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
@@ -347,13 +401,13 @@ def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, o
         step_dur = time.time() - t0
         durations.append(step_dur)
         iterator.set_postfix({"last_loss": f"{loss_val:.4f}", "step_s": f"{step_dur:.3f}"}, refresh=False)
-    return {"loss_last": loss_val, "durations": durations}
+    return {"loss_last": loss_val, "durations": durations, "compiled": compiled}
 
 
 # ---------------------- jax path ---------------------- #
 
 
-def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_heads: int, mlp_ratio: float, dropout: float, attention_variant: str):
+def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_heads: int, kv_heads: int, mlp_ratio: float, dropout: float, attention_variant: str):
     import flax.linen as nn
     import jax.numpy as jnp
     from flax.linen import dot_product_attention
@@ -361,15 +415,22 @@ def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_he
     class LocalSelfAttention(nn.Module):
         window: int
         num_heads: int
+        kv_heads: int
         head_dim: int
 
         @nn.compact
         def __call__(self, x, deterministic: bool):
-            qkv = nn.Dense(self.num_heads * self.head_dim * 3)(x)
-            q, k, v = jnp.split(qkv, 3, axis=-1)
+            qkv = nn.Dense(self.num_heads * self.head_dim + self.kv_heads * self.head_dim * 2)(x)
+            split1 = self.num_heads * self.head_dim
+            split2 = split1 + self.kv_heads * self.head_dim
+            q, k, v = jnp.split(qkv, [split1, split2], axis=-1)
             q = q.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            k = k.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
-            v = v.reshape(x.shape[0], x.shape[1], self.num_heads, self.head_dim)
+            k = k.reshape(x.shape[0], x.shape[1], self.kv_heads, self.head_dim)
+            v = v.reshape(x.shape[0], x.shape[1], self.kv_heads, self.head_dim)
+            if self.kv_heads != self.num_heads:
+                repeat = self.num_heads // self.kv_heads
+                k = jnp.repeat(k, repeat, axis=2)
+                v = jnp.repeat(v, repeat, axis=2)
             seq_len = x.shape[1]
             idx = jnp.arange(seq_len)
             diff = idx[:, None] - idx[None, :]
@@ -384,9 +445,9 @@ def make_jax_model(vocab_size: int, seq_len: int, depth: int, width: int, num_he
         def __call__(self, x, deterministic: bool):
             y = nn.LayerNorm()(x)
             if attention_variant == "local":
-                attn = LocalSelfAttention(window=128, num_heads=num_heads, head_dim=width // num_heads)(y, deterministic)
+                attn = LocalSelfAttention(window=128, num_heads=num_heads, kv_heads=kv_heads, head_dim=width // num_heads)(y, deterministic)
             elif attention_variant == "sliding":
-                attn = LocalSelfAttention(window=256, num_heads=num_heads, head_dim=width // num_heads)(y, deterministic)
+                attn = LocalSelfAttention(window=256, num_heads=num_heads, kv_heads=kv_heads, head_dim=width // num_heads)(y, deterministic)
             else:
                 attn = nn.SelfAttention(num_heads=num_heads, dtype=jnp.float32)(y)
             x = x + nn.Dropout(dropout)(attn, deterministic=deterministic)
@@ -441,6 +502,7 @@ def run_jax(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, obj
         depth=config.depth,
         width=config.width,
         num_heads=config.num_heads,
+        kv_heads=config.kv_heads,
         mlp_ratio=config.mlp_ratio,
         dropout=config.dropout,
         attention_variant=config.attention_variant,
@@ -496,6 +558,9 @@ def run_jax(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, obj
 class RunConfig:
     framework: str
     precision: str
+    compilation_mode: str
+    attention_backend: str
+    kv_heads: int
     seq_len: int
     vocab_size: int
     depth: int
@@ -515,10 +580,14 @@ def build_single_config(args) -> List[RunConfig]:
     configs: List[RunConfig] = []
     for framework in args.frameworks:
         for precision in args.precisions:
+            kv_heads = min(args.kv_heads_options[0] if args.kv_heads_options else args.heads, args.heads)
             configs.append(
                 RunConfig(
                     framework=framework,
                     precision=precision,
+                    compilation_mode=args.compilation_modes[0] if args.compilation_modes else "eager",
+                    attention_backend=args.attention_backends[0] if args.attention_backends else "manual",
+                    kv_heads=kv_heads,
                     seq_len=args.seq_len,
                     vocab_size=257,  # byte + pad token
                     depth=args.depth,
@@ -528,7 +597,7 @@ def build_single_config(args) -> List[RunConfig]:
                     dropout=args.dropout,
                     attention_variant=args.attention_variant,
                     steps=args.steps,
-                    batch_size=args.batch_size,
+                    batch_size=args.batch_options[0] if args.batch_options else args.batch_size,
                     num_threads=args.threads,
                     inter_op_threads=args.inter_threads,
                     pin_threads=args.pin_threads,
@@ -552,29 +621,41 @@ def build_sweep_configs(args) -> List[RunConfig]:
     ]
     configs: List[RunConfig] = []
     for framework in args.frameworks:
+        comp_modes = args.compilation_modes if framework == "torch" else ["jit"]
         for precision in args.precisions:
-            for scenario in scenarios:
-                for threads in thread_options:
-                    for pin in pin_options:
-                        configs.append(
-                            RunConfig(
-                                framework=framework,
-                                precision=precision,
-                                seq_len=scenario["seq_len"],
-                                vocab_size=257,
-                                depth=scenario["depth"],
-                                width=scenario["width"],
-                                num_heads=scenario["heads"],
-                                mlp_ratio=args.mlp_ratio,
-                                dropout=args.dropout,
-                                attention_variant=scenario["attention_variant"],
-                                steps=args.steps,
-                                batch_size=args.batch_size,
-                                num_threads=threads,
-                                inter_op_threads=args.inter_threads,
-                                pin_threads=pin,
-                            )
-                        )
+            for compilation_mode in comp_modes:
+                for scenario in scenarios:
+                    kv_list = [k for k in args.kv_heads_options if k <= scenario["heads"]] or [scenario["heads"]]
+                    for attention_backend in args.attention_backends:
+                        backend = attention_backend
+                        if scenario["attention_variant"] != "full" and attention_backend == "sdpa":
+                            backend = "manual"
+                        for kv_heads in kv_list:
+                            for batch_size in args.batch_options:
+                                for threads in thread_options:
+                                    for pin in pin_options:
+                                        configs.append(
+                                            RunConfig(
+                                                framework=framework,
+                                                precision=precision,
+                                                compilation_mode=compilation_mode,
+                                                attention_backend=backend,
+                                                kv_heads=kv_heads,
+                                                seq_len=scenario["seq_len"],
+                                                vocab_size=257,
+                                                depth=scenario["depth"],
+                                                width=scenario["width"],
+                                                num_heads=scenario["heads"],
+                                                mlp_ratio=args.mlp_ratio,
+                                                dropout=args.dropout,
+                                                attention_variant=scenario["attention_variant"],
+                                                steps=args.steps,
+                                                batch_size=batch_size,
+                                                num_threads=threads,
+                                                inter_op_threads=args.inter_threads,
+                                                pin_threads=pin,
+                                            )
+                                        )
     return configs
 
 
@@ -618,6 +699,9 @@ def config_key(cfg: RunConfig) -> str:
         [
             cfg.framework,
             cfg.precision,
+            cfg.compilation_mode,
+            cfg.attention_backend,
+            str(cfg.kv_heads),
             str(cfg.seq_len),
             str(cfg.depth),
             str(cfg.width),
@@ -644,6 +728,9 @@ def load_completed_configs(csv_path: Path) -> set:
     required_cols = [
         "framework",
         "precision",
+        "compilation_mode",
+        "attention_backend",
+        "kv_heads",
         "seq_len",
         "depth",
         "width",
@@ -664,6 +751,9 @@ def load_completed_configs(csv_path: Path) -> set:
         cfg = RunConfig(
             framework=row["framework"],
             precision=row["precision"],
+            compilation_mode=row.get("compilation_mode", "eager"),
+            attention_backend=row.get("attention_backend", "manual"),
+            kv_heads=int(row["kv_heads"]) if "kv_heads" in row else int(row["num_heads"]),
             seq_len=int(row["seq_len"]),
             vocab_size=257,
             depth=int(row["depth"]),
@@ -687,6 +777,9 @@ def main():
     parser.add_argument("--frameworks", default="torch,jax", help="Comma-separated: torch,jax")
     parser.add_argument("--precisions", default="fp32,bf16,q8,q4,bitnet", help="Comma-separated precision/quant modes")
     parser.add_argument("--mode", choices=["sweep", "single"], default="sweep", help="sweep runs curated matrix by default")
+    parser.add_argument("--compilation-modes", default="eager,compile", help="Comma-separated: eager,compile")
+    parser.add_argument("--attention-backends", default="manual,sdpa", help="Comma-separated attention backends")
+    parser.add_argument("--kv-heads-options", default="1", help="Comma-separated kv_heads options (<= num_heads)")
     parser.add_argument("--seq-len", type=int, default=256)
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--width", type=int, default=512)
@@ -696,6 +789,7 @@ def main():
     parser.add_argument("--attention-variant", choices=["full", "local", "sliding"], default="full")
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-options", type=str, default="1,2,4,8,16,32,64", help="Comma-separated batch sizes to sweep")
     parser.add_argument("--threads", type=int, default=max(1, psutil.cpu_count(logical=False) or 1))
     parser.add_argument("--inter-threads", type=int, default=None)
     parser.add_argument("--pin-threads", action="store_true")
@@ -713,6 +807,10 @@ def main():
     args.frameworks = [f.strip() for f in args.frameworks.split(",") if f.strip()]
     args.precisions = [p.strip() for p in args.precisions.split(",") if p.strip()]
     args.thread_options = [t.strip() for t in args.thread_options.split(",") if t.strip()]
+    args.compilation_modes = [c.strip() for c in args.compilation_modes.split(",") if c.strip()]
+    args.attention_backends = [a.strip() for a in args.attention_backends.split(",") if a.strip()]
+    args.kv_heads_options = [int(k) for k in args.kv_heads_options.split(",") if k.strip()]
+    args.batch_options = [int(b) for b in args.batch_options.split(",") if b.strip()]
 
     configs = build_sweep_configs(args) if args.mode == "sweep" else build_single_config(args)
     unique_seq_lens = sorted({cfg.seq_len for cfg in configs})
@@ -742,11 +840,12 @@ def main():
         if key in completed:
             print(
                 f"[skip {idx}/{len(configs)} | already in results] {cfg.framework} precision={cfg.precision} "
-                f"threads={cfg.num_threads} seq={cfg.seq_len} pin={cfg.pin_threads}"
+                f"threads={cfg.num_threads} seq={cfg.seq_len} pin={cfg.pin_threads} batch={cfg.batch_size}"
             )
             continue
         print(
-            f"[run {idx}/{len(configs)} | ETA ~{remaining:.1f}s] {cfg.framework} precision={cfg.precision} steps={cfg.steps} "
+            f"[run {idx}/{len(configs)} | ETA ~{remaining:.1f}s] {cfg.framework} precision={cfg.precision} mode={cfg.compilation_mode} "
+            f"attn={cfg.attention_backend} kv={cfg.kv_heads} steps={cfg.steps} batch={cfg.batch_size} "
             f"threads={cfg.num_threads} seq={cfg.seq_len} depth={cfg.depth} width={cfg.width} heads={cfg.num_heads} pin={cfg.pin_threads}"
         )
         print(
@@ -765,6 +864,8 @@ def main():
             "mean_step_time": float(np.mean(out["durations"])),
             "p95_step_time": float(np.percentile(out["durations"], 95)),
         }
+        if "compiled" in out:
+            result_row["compiled"] = out["compiled"]
         csv_header = write_result_row(result_row, csv_path, jsonl_path, csv_header)
 
     print(f"[done] appended results to {csv_path} and {jsonl_path}")

@@ -40,6 +40,7 @@ def load_results(path: Path) -> pd.DataFrame:
             + df["width"].astype(str)
             + "-h"
             + df["num_heads"].astype(str)
+            + (("-kv" + df["kv_heads"].astype(str)) if "kv_heads" in df.columns else "")
         )
     return df
 
@@ -62,6 +63,9 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
         for col in [
             "framework",
             "precision",
+            "compilation_mode",
+            "attention_backend",
+            "kv_heads",
             "num_threads",
             "seq_len",
             "depth",
@@ -75,19 +79,17 @@ def aggregate(df: pd.DataFrame) -> pd.DataFrame:
         ]
         if col in df.columns
     ]
-    agg = (
-        df.groupby(group_cols)
-        .agg(
-            mean_step_time=("mean_step_time", "mean"),
-            p95_step_time=("p95_step_time", "mean"),
-            tokens_per_sec=("tokens_per_sec", "mean") if "tokens_per_sec" in df.columns else None,
-            efficiency_tokens_per_sec_per_thread=("efficiency_tokens_per_sec_per_thread", "mean")
-            if "efficiency_tokens_per_sec_per_thread" in df.columns
-            else None,
-            count=("mean_step_time", "count"),
-        )
-        .reset_index()
-    )
+    agg_dict = {
+        "mean_step_time": ("mean_step_time", "mean"),
+        "p95_step_time": ("p95_step_time", "mean"),
+        "count": ("mean_step_time", "count"),
+    }
+    if "tokens_per_sec" in df.columns:
+        agg_dict["tokens_per_sec"] = ("tokens_per_sec", "mean")
+    if "efficiency_tokens_per_sec_per_thread" in df.columns:
+        agg_dict["efficiency_tokens_per_sec_per_thread"] = ("efficiency_tokens_per_sec_per_thread", "mean")
+
+    agg = df.groupby(group_cols).agg(**agg_dict).reset_index()
     return agg
 
 

@@ -30,6 +30,8 @@ Some variables can be **varied within the same device**, while others can only b
 * NumPy / PyTorch / JAX
 * Kernel fusion on/off
 * JIT warmup state
+* torch.compile (Inductor) vs eager
+* Attention backend: manual vs SDPA fused
 
 ## Model & Training
 
@@ -51,6 +53,8 @@ Some variables can be **varied within the same device**, while others can only b
 * Sequence length: *Recommended range: 128, 256, 512, 1024, 2048*
 
 * Quantization / precision mode: *FP32, BF16, mixed precision, q8, q4, bitnet*
+* GQA/MQA (`kv_heads` ≤ `num_heads`) to reduce KV bandwidth
+* Batch size sweep (to probe cache hierarchy)
 
 * Dataset size (only affects measurement duration)
 
@@ -89,6 +93,11 @@ Some variables can be **varied within the same device**, while others can only b
 
 * Pre-training: TBD
 * Fine-tuning: TBD
+
+# Additional CPU/Memory tuning
+
+* Allocator: jemalloc vs default (recorded)
+* NUMA awareness (record socket/core binding)
 
 # Assumptions
 
