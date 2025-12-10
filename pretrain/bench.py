@@ -87,12 +87,13 @@ def set_threading(num_threads: int, interop_threads: Optional[int] = None) -> No
     os.environ["OMP_NUM_THREADS"] = str(num_threads)
     os.environ["OPENBLAS_NUM_THREADS"] = str(num_threads)
     os.environ["MKL_NUM_THREADS"] = str(num_threads)
+    os.environ["OMP_DYNAMIC"] = "0"
+    os.environ["MKL_DYNAMIC"] = "0"
     try:
         import torch
 
         torch.set_num_threads(num_threads)
-        if interop_threads is not None:
-            torch.set_num_interop_threads(interop_threads)
+        torch.set_num_interop_threads(interop_threads if interop_threads is not None else num_threads)
     except Exception:
         pass
 
@@ -612,6 +613,9 @@ def main():
         print(
             f"[run {idx}/{len(configs)} | ETA ~{remaining:.1f}s] {cfg.framework} precision={cfg.precision} steps={cfg.steps} "
             f"threads={cfg.num_threads} seq={cfg.seq_len} depth={cfg.depth} width={cfg.width} heads={cfg.num_heads} pin={cfg.pin_threads}"
+        )
+        print(
+            f"    threading env -> OMP={cfg.num_threads}, MKL={cfg.num_threads}, inter-op={cfg.inter_op_threads or cfg.num_threads}, pin={cfg.pin_threads}"
         )
         batches = batched(data_cache[cfg.seq_len], cfg.batch_size)
         if cfg.framework == "torch":
