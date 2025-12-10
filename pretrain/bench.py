@@ -7,6 +7,7 @@ and logging wall-clock training times plus system metadata.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -568,6 +569,35 @@ def batched(arr: np.ndarray, batch_size: int) -> Iterable[np.ndarray]:
         yield arr[start:end]
 
 
+def load_existing_csv_header(csv_path: Path) -> Optional[List[str]]:
+    if not csv_path.exists():
+        return None
+    with csv_path.open("r", encoding="utf-8") as f:
+        first_line = f.readline().strip()
+    if not first_line:
+        return None
+    return first_line.split(",")
+
+
+def write_result_row(row: Dict[str, object], csv_path: Path, jsonl_path: Path, header: Optional[List[str]]) -> List[str]:
+    row_for_csv = {k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in row.items()}
+    if header is None:
+        header = list(row_for_csv.keys())
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row_for_csv)
+    with jsonl_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+    return header
+
+
 def main():
     parser = argparse.ArgumentParser(description="CPU transformer decoder benchmark (PyTorch + JAX)")
     parser.add_argument("--frameworks", default="torch,jax", help="Comma-separated: torch,jax")
@@ -609,8 +639,11 @@ def main():
         cache = prepare_dataset(seq_len=sl, max_sequences=args.max_sequences)
         data_cache[sl] = load_cached_dataset(cache)
 
-    results = []
     sysinfo = collect_sysinfo()
+    csv_path = Path(args.result_path)
+    jsonl_path = Path(args.jsonl)
+    csv_header = load_existing_csv_header(csv_path)
+
     print(f"[plan] running {len(configs)} configs in {args.mode} mode")
     overall_start = time.time()
     for idx, cfg in enumerate(configs, 1):
@@ -640,14 +673,9 @@ def main():
             "mean_step_time": float(np.mean(out["durations"])),
             "p95_step_time": float(np.percentile(out["durations"], 95)),
         }
-        results.append(result_row)
+        csv_header = write_result_row(result_row, csv_path, jsonl_path, csv_header)
 
-    df = pd.DataFrame(results)
-    df.to_csv(args.result_path, index=False)
-    with open(args.jsonl, "w", encoding="utf-8") as f:
-        for row in results:
-            f.write(json.dumps(row) + "\n")
-    print(f"[done] wrote {args.result_path} and {args.jsonl}")
+    print(f"[done] appended results to {csv_path} and {jsonl_path}")
 
 
 if __name__ == "__main__":
