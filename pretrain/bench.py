@@ -524,7 +524,10 @@ def build_single_config(args) -> List[RunConfig]:
 def build_sweep_configs(args) -> List[RunConfig]:
     physical = psutil.cpu_count(logical=False) or 1
     logical = psutil.cpu_count(logical=True) or physical
-    thread_options = sorted(set([1, min(4, physical), physical, logical]))
+    if args.thread_options:
+        thread_options = sorted({int(t) for t in args.thread_options})
+    else:
+        thread_options = list(range(1, logical + 1))
     pin_options = [False, True]
 
     scenarios = [
@@ -582,6 +585,12 @@ def main():
     parser.add_argument("--threads", type=int, default=max(1, psutil.cpu_count(logical=False) or 1))
     parser.add_argument("--inter-threads", type=int, default=None)
     parser.add_argument("--pin-threads", action="store_true")
+    parser.add_argument(
+        "--thread-options",
+        type=str,
+        default="",
+        help="Comma-separated thread counts to sweep (defaults to 1..logical cores)",
+    )
     parser.add_argument("--max-sequences", type=int, default=256, help="limit cached sequences for quick runs")
     parser.add_argument("--result-path", type=str, default="result/bench_results.csv")
     parser.add_argument("--jsonl", type=str, default="result/bench_results.jsonl")
@@ -589,6 +598,7 @@ def main():
 
     args.frameworks = [f.strip() for f in args.frameworks.split(",") if f.strip()]
     args.precisions = [p.strip() for p in args.precisions.split(",") if p.strip()]
+    args.thread_options = [t.strip() for t in args.thread_options.split(",") if t.strip()]
 
     configs = build_sweep_configs(args) if args.mode == "sweep" else build_single_config(args)
     unique_seq_lens = sorted({cfg.seq_len for cfg in configs})
