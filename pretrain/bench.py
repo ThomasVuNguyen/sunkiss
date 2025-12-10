@@ -677,18 +677,32 @@ def load_existing_csv_header(csv_path: Path) -> Optional[List[str]]:
 
 def write_result_row(row: Dict[str, object], csv_path: Path, jsonl_path: Path, header: Optional[List[str]]) -> List[str]:
     row_for_csv = {k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in row.items()}
-    if header is None:
-        header = list(row_for_csv.keys())
-
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-    with csv_path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=header)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row_for_csv)
+    # Ensure header includes any new keys; if not, reload and rewrite the CSV with merged columns.
+    existing_cols = set(header) if header else set()
+    row_cols = set(row_for_csv.keys())
+    missing = row_cols - existing_cols
+    if csv_path.exists() and (missing or header is None):
+        try:
+            df_existing = pd.read_csv(csv_path)
+        except Exception:
+            df_existing = pd.DataFrame()
+        df_new = pd.DataFrame([row_for_csv])
+        df_merged = pd.concat([df_existing, df_new], ignore_index=True)
+        df_merged.to_csv(csv_path, index=False)
+        header = list(df_merged.columns)
+    else:
+        if header is None:
+            header = list(row_for_csv.keys())
+        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row_for_csv)
+
     with jsonl_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row) + "\n")
     return header
