@@ -266,7 +266,7 @@ def apply_torch_quantization(model, mode: str):
                 qmin, qmax = -8, 7
             else:
                 qmin, qmax = -1, 1
-            scale = self.weight.abs().max() / max(abs(qmin), abs(qmax)) + 1e-8
+            scale = float(self.weight.abs().max() / max(abs(qmin), abs(qmax)) + 1e-8)
             zp = 0
             w_q = torch.fake_quantize_per_tensor_affine(self.weight, scale, zp, qmin, qmax)
             return F.linear(x, w_q, self.bias)
@@ -614,6 +614,75 @@ def write_result_row(row: Dict[str, object], csv_path: Path, jsonl_path: Path, h
     return header
 
 
+def config_key(cfg: RunConfig) -> str:
+    return "|".join(
+        [
+            cfg.framework,
+            cfg.precision,
+            str(cfg.seq_len),
+            str(cfg.depth),
+            str(cfg.width),
+            str(cfg.num_heads),
+            f"{cfg.mlp_ratio}",
+            f"{cfg.dropout}",
+            cfg.attention_variant,
+            str(cfg.steps),
+            str(cfg.batch_size),
+            str(cfg.num_threads),
+            str(cfg.inter_op_threads),
+            str(cfg.pin_threads),
+        ]
+    )
+
+
+def load_completed_configs(csv_path: Path) -> set:
+    if not csv_path.exists():
+        return set()
+    try:
+        df = pd.read_csv(csv_path)
+    except Exception:
+        return set()
+    required_cols = [
+        "framework",
+        "precision",
+        "seq_len",
+        "depth",
+        "width",
+        "num_heads",
+        "mlp_ratio",
+        "dropout",
+        "attention_variant",
+        "steps",
+        "batch_size",
+        "num_threads",
+        "inter_op_threads",
+        "pin_threads",
+    ]
+    if not all(col in df.columns for col in required_cols):
+        return set()
+    completed = set()
+    for _, row in df.iterrows():
+        cfg = RunConfig(
+            framework=row["framework"],
+            precision=row["precision"],
+            seq_len=int(row["seq_len"]),
+            vocab_size=257,
+            depth=int(row["depth"]),
+            width=int(row["width"]),
+            num_heads=int(row["num_heads"]),
+            mlp_ratio=float(row["mlp_ratio"]),
+            dropout=float(row["dropout"]),
+            attention_variant=row["attention_variant"],
+            steps=int(row["steps"]),
+            batch_size=int(row["batch_size"]),
+            num_threads=int(row["num_threads"]),
+            inter_op_threads=int(row["inter_op_threads"]) if not pd.isna(row["inter_op_threads"]) else None,
+            pin_threads=bool(row["pin_threads"]),
+        )
+        completed.add(config_key(cfg))
+    return completed
+
+
 def main():
     parser = argparse.ArgumentParser(description="CPU transformer decoder benchmark (PyTorch + JAX)")
     parser.add_argument("--frameworks", default="torch,jax", help="Comma-separated: torch,jax")
@@ -659,6 +728,7 @@ def main():
     csv_path = Path(args.result_path)
     jsonl_path = Path(args.jsonl)
     csv_header = load_existing_csv_header(csv_path)
+    completed = load_completed_configs(csv_path)
 
     print(f"[plan] running {len(configs)} configs in {args.mode} mode")
     overall_start = time.time()
@@ -669,6 +739,13 @@ def main():
             remaining = avg * (len(configs) - idx + 1)
         else:
             remaining = 0.0
+        key = config_key(cfg)
+        if key in completed:
+            print(
+                f"[skip {idx}/{len(configs)} | already in results] {cfg.framework} precision={cfg.precision} "
+                f"threads={cfg.num_threads} seq={cfg.seq_len} pin={cfg.pin_threads}"
+            )
+            continue
         print(
             f"[run {idx}/{len(configs)} | ETA ~{remaining:.1f}s] {cfg.framework} precision={cfg.precision} steps={cfg.steps} "
             f"threads={cfg.num_threads} seq={cfg.seq_len} depth={cfg.depth} width={cfg.width} heads={cfg.num_heads} pin={cfg.pin_threads}"
