@@ -352,12 +352,16 @@ def torch_train_step(model, optimizer, loss_fn, batch, precision: str):
 
 def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, object]:
     import torch
+    import torch._dynamo
     from tqdm import tqdm
 
     set_threading(config.num_threads, interop_threads=config.inter_op_threads)
     if config.pin_threads:
         cores = list(range(config.num_threads))
         maybe_set_cpu_affinity(cores)
+
+    # allow compile failures to fall back to eager instead of crashing
+    torch._dynamo.config.suppress_errors = True
 
     model = make_torch_model(
         vocab_size=config.vocab_size,
@@ -397,7 +401,30 @@ def run_torch(config: "RunConfig", batches: Iterable[np.ndarray]) -> Dict[str, o
             break
         batch = torch.tensor(batch_np, dtype=torch.long)
         t0 = time.time()
-        loss_val = torch_train_step(model, optimizer, loss_fn, batch, precision=config.precision)
+        try:
+            loss_val = torch_train_step(model, optimizer, loss_fn, batch, precision=config.precision)
+        except Exception as exc:
+            # If compiled model fails at runtime, fall back to eager once
+            if compiled:
+                print(f"[warn] compiled path failed ({exc}); retrying in eager")
+                compiled = False
+                model = make_torch_model(
+                    vocab_size=config.vocab_size,
+                    seq_len=config.seq_len,
+                    depth=config.depth,
+                    width=config.width,
+                    num_heads=config.num_heads,
+                    kv_heads=config.kv_heads,
+                    mlp_ratio=config.mlp_ratio,
+                    dropout=config.dropout,
+                    attention_variant=config.attention_variant,
+                    attention_backend=config.attention_backend,
+                )
+                model = apply_torch_quantization(model, config.precision).to("cpu")
+                optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+                loss_val = torch_train_step(model, optimizer, loss_fn, batch, precision=config.precision)
+            else:
+                raise
         step_dur = time.time() - t0
         durations.append(step_dur)
         iterator.set_postfix({"last_loss": f"{loss_val:.4f}", "step_s": f"{step_dur:.3f}"}, refresh=False)
