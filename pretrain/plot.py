@@ -202,6 +202,10 @@ def main():
     args = parser.parse_args()
 
     input_path = Path(args.input)
+    if input_path.is_dir():
+        candidate = input_path / "bench_results.csv"
+        if candidate.exists():
+            input_path = candidate
     outdir = Path(args.output_dir)
     ensure_outdir(outdir)
 
